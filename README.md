@@ -104,3 +104,175 @@ Design a heads-up display (HUD) that presents a 3D holographic face by capturing
 * Source or build the capture rig.
 * Prototype end‑to‑end with a minimal camera array.
 * Iteratively refine reconstruction quality and display setup.
+
+------------------------------------------
+
+To turn your multi‑angle captures into a coherent “floating” head, you need two key steps:
+
+1. **Geometric alignment** (undistortion, extrinsic calibration & recti­fication)
+2. **Image processing/fusion** (view‑dependent warping, blending or view synthesis)
+
+Below is a realistic end‑to‑end recipe—using OpenCV in Python—for an N‑camera rig. You’ll need a calibration target (e.g. checkerboard) and all cameras synchronized.
+
+---
+
+## 1. Intrinsic & Extrinsic Calibration
+
+```python
+import cv2
+import numpy as np
+import glob
+
+# === 1.1 Prepare object points for checkerboard ===
+checkerboard = (9, 6)               # inner corners per row/col
+square_size = 0.025                # in meters
+objp = np.zeros((checkerboard[0]*checkerboard[1], 3), np.float32)
+objp[:, :2] = np.indices(checkerboard).T.reshape(-1, 2)
+objp *= square_size
+
+# === 1.2 Gather image points from each cam ===
+all_objpoints = []   # same for every cam
+all_imgpoints = []   # list of lists, one list per cam
+
+image_files = sorted(glob.glob('cam0/*.jpg'))
+num_cams = 4  # adjust to your rig
+for cam_id in range(num_cams):
+    img_pts = []
+    for fname in sorted(glob.glob(f'cam{cam_id}/*.jpg')):
+        img = cv2.imread(fname)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        found, corners = cv2.findChessboardCorners(gray, checkerboard)
+        if found:
+            cv2.cornerSubPix(gray, corners, (11,11), (-1,-1),
+                             (cv2.TermCriteria_EPS + cv2.TermCriteria_COUNT, 30, 0.001))
+            img_pts.append(corners)
+    all_imgpoints.append(img_pts)
+
+# assume all cameras see the pattern same number of frames
+all_objpoints = [objp] * len(all_imgpoints[0])
+
+# === 1.3 Calibrate each camera intrinsically ===
+intrinsics = []
+dist_coeffs = []
+for img_pts in all_imgpoints:
+    ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+        all_objpoints, img_pts, gray.shape[::-1], None, None)
+    intrinsics.append(K)
+    dist_coeffs.append(dist)
+```
+
+---
+
+## 2. Extrinsic (Stereo) Calibration & Rectification
+
+Pick one camera as the reference (e.g. cam0), then stereo‑calibrate each other cam to it:
+
+```python
+R_rel = []
+T_rel = []
+rect_transforms = []
+
+for cam_id in range(1, num_cams):
+    # stereoCalibrate between cam0 and camN
+    flags = (cv2.CALIB_FIX_INTRINSIC)
+    ret, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
+        all_objpoints,
+        all_imgpoints[0], all_imgpoints[cam_id],
+        intrinsics[0], dist_coeffs[0],
+        intrinsics[cam_id], dist_coeffs[cam_id],
+        gray.shape[::-1],
+        criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6),
+        flags=flags)
+    R_rel.append(R); T_rel.append(T)
+
+    # compute rectification maps
+    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+        intrinsics[0], dist_coeffs[0],
+        intrinsics[cam_id], dist_coeffs[cam_id],
+        gray.shape[::-1], R, T, alpha=0)
+    map1x, map1y = cv2.initUndistortRectifyMap(
+        intrinsics[0], dist_coeffs[0], R1, P1, gray.shape[::-1], cv2.CV_32FC1)
+    map2x, map2y = cv2.initUndistortRectifyMap(
+        intrinsics[cam_id], dist_coeffs[cam_id], R2, P2, gray.shape[::-1], cv2.CV_32FC1)
+    rect_transforms.append(((map1x, map1y), (map2x, map2y)))
+```
+
+---
+
+## 3. Real‑Time Capture, Rectify & Blend
+
+```python
+# open all camera streams (or VideoCapture indices)
+caps = [cv2.VideoCapture(i) for i in range(num_cams)]
+
+while True:
+    # 3.1 Grab & rectify
+    frames = [caps[0].read()[1]]  # reference cam
+    for i in range(1, num_cams):
+        _, img = caps[i].read()
+        (m1x, m1y), (m2x, m2y) = rect_transforms[i‑1]
+        # remap to rectified views
+        _ , ref_rect = cv2.remap(frames[0], m1x, m1y, cv2.INTER_LINEAR)
+        _, cam_rect = cv2.remap(img, m2x, m2y, cv2.INTER_LINEAR)
+        frames.append(cam_rect)
+
+    # 3.2 Simple cylindrical warp & mosaic
+    h, w = frames[0].shape[:2]
+    cyl_imgs = []
+    f = 800  # focal length in px
+    for img in frames:
+        # map to cylinder coords
+        cyl = np.zeros_like(img)
+        for y in range(h):
+            for x in range(w):
+                theta = (x - w/2) / f
+                Xc = np.sin(theta)
+                Zc = np.cos(theta)
+                xs = int(f * Xc / Zc + w/2)
+                if 0 <= xs < w:
+                    cyl[y, xs] = img[y, x]
+        cyl_imgs.append(cyl)
+
+    # 3.3 Blend all cylindrical images into one composite
+    composite = np.zeros_like(cyl_imgs[0])
+    weight = np.zeros((h, w), np.float32)
+    for img in cyl_imgs:
+        mask = (img.sum(axis=2) > 0).astype(np.float32)[...,None]
+        composite += img * mask
+        weight += mask[...,0]
+    composite = (composite / weight[...,None]).astype(np.uint8)
+
+    # 3.4 Display
+    cv2.imshow('3D Head HUD', composite)
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+for c in caps: c.release()
+cv2.destroyAllWindows()
+```
+
+---
+
+### What’s happening here?
+
+1. **Calibration**
+   • You compute each cam’s intrinsic matrix & distortion.
+   • Then stereo‑calibrate every cam against cam 0 to get relative pose (R, T).
+2. **Rectification**
+   • `stereoRectify` gives you mapping functions to undistort + align images into a common epipolar geometry.
+3. **Warping to cylinder**
+   • This approximates “looking around” by warping each flat image onto a cylinder centered on the head.
+4. **Blending**
+   • You average overlapping pixels to soften seams.
+5. **Result**
+   • A single “panorama” you can project onto your HUD—when the viewer moves, you pick a different set of cams or re‑warp with a new virtual camera yaw.
+
+---
+
+#### Next Steps
+
+* **Latency optimizations**: move remapping and cylindrical warp into GPU shaders (OpenGL/GLSL).
+* **View‑dependent interpolation**: instead of hard switching, do cross‑dissolve or deep‑learned morphing between nearest angles.
+* **Volumetric capture**: swap cylinder for a mesh/point‑cloud and render with real‐time ray‐casting.
+
+Feel free to ask for deeper dives on any of those components!
